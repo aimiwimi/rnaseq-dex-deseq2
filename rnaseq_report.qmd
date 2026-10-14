@@ -1,0 +1,272 @@
+---
+title: "Differential expression in dexamethasone-treated airway smooth muscle cells"
+subtitle: "RNA-seq re-analysis of GEO series GSE52778 with DESeq2 and clusterProfiler"
+author: "AMY GAO"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    code-fold: true
+    embed-resources: true
+    theme: cosmo
+execute:
+  warning: false
+  message: false
+---
+
+# Background and aim
+
+Glucocorticoids such as dexamethasone are widely used to treat asthma and other inflammatory airway diseases. This report re-analyses the public RNA-seq dataset of Himes et al. (2014), available on GEO as **GSE52778** and packaged in Bioconductor as `airway`. It contains eight samples from four primary human airway smooth muscle cell lines, each either untreated or treated with dexamethasone.
+
+**Aim:** identify genes whose expression changes after dexamethasone treatment, and describe the biological processes they are involved in.
+
+# Methods overview
+
+Raw read counts were filtered to remove lowly expressed genes, and differential expression was tested with DESeq2 using the design `~ cell + dex`. This compares treated with untreated samples while accounting for differences between the four cell lines (each cell line was measured in both conditions). Fold changes were shrunk with the `apeglm` method. Genes were called significant at an adjusted p-value (Benjamini-Hochberg) below 0.05 and an absolute log2 fold change above 1. Gene Ontology (Biological Process) over-representation was tested with `clusterProfiler`, using all genes that were tested for differential expression as the background.
+
+# 1. Setup
+
+```{r}
+#| label: setup
+library(DESeq2)
+library(airway)
+library(tidyverse)
+library(pheatmap)
+library(ggrepel)
+library(org.Hs.eg.db)
+library(clusterProfiler)
+library(enrichplot)
+
+dir.create("figures", showWarnings = FALSE)
+dir.create("results", showWarnings = FALSE)
+```
+
+# 2. Data
+
+```{r}
+#| label: data
+data("airway")
+se <- airway
+se$dex <- relevel(se$dex, ref = "untrt")   # untreated is the baseline
+
+knitr::kable(
+  as.data.frame(colData(se))[, c("SampleName", "cell", "dex")],
+  caption = "Samples in the airway dataset (dex = dexamethasone; trt = treated, untrt = untreated)"
+)
+```
+
+The count matrix contains `r nrow(se)` genes (rows) across `r ncol(se)` samples (columns). Values are raw, un-normalised read counts, which is the input DESeq2 requires.
+
+# 3. Filtering
+
+```{r}
+#| label: filter
+dds <- DESeqDataSet(se, design = ~ cell + dex)
+
+n_before <- nrow(dds)
+keep <- rowSums(counts(dds) >= 10) >= 4   # at least 10 reads in at least 4 samples
+dds <- dds[keep, ]
+n_after <- nrow(dds)
+```
+
+Genes were kept if they had at least 10 reads in at least 4 of the 8 samples. This reduced the dataset from `r n_before` to `r n_after` genes, because genes with almost no reads cannot be tested reliably.
+
+# 4. Quality control
+
+Before testing, I checked whether samples group sensibly. Counts were transformed with the variance-stabilising transformation (VST) for visualisation only; the statistical testing below uses the raw counts.
+
+```{r}
+#| label: pca
+#| fig-width: 6
+#| fig-height: 5
+vsd <- vst(dds, blind = TRUE)
+
+pca_plot <- plotPCA(vsd, intgroup = c("dex", "cell")) + theme_bw()
+ggsave("figures/pca.png", pca_plot, width = 6, height = 5, dpi = 300)
+pca_plot
+```
+
+PC1 (43% of variance) clearly separates dexamethasone-treated from untreated samples, with all four treated samples on the right and all four untreated on the left, while PC2 (25%) mainly separates the cell lines, with N080611 sitting apart from the other three. No sample appears to be an outlier.
+
+```{r}
+#| label: heatmap
+sample_dists <- dist(t(assay(vsd)))
+pheatmap(
+  as.matrix(sample_dists),
+  annotation_col = as.data.frame(colData(vsd)[, c("dex", "cell")]),
+  filename = "figures/sample_distance_heatmap.png"
+)
+knitr::include_graphics("figures/sample_distance_heatmap.png")
+```
+
+Samples cluster first by treatment, with the four untreated and four treated samples forming two distinct groups, and within each group the cell lines cluster in the same order, with N080611 the most distinct. This confirms that dexamethasone is the dominant source of variation and supports accounting for cell line in the design.
+
+# 5. Differential expression
+
+```{r}
+#| label: deseq
+dds <- DESeq(dds)
+
+res <- results(dds, contrast = c("dex", "trt", "untrt"), alpha = 0.05)
+resLFC <- lfcShrink(dds, coef = "dex_trt_vs_untrt", type = "apeglm")
+
+n_up   <- sum(res$padj < 0.05 & res$log2FoldChange > 0, na.rm = TRUE)
+n_down <- sum(res$padj < 0.05 & res$log2FoldChange < 0, na.rm = TRUE)
+```
+
+At an adjusted p-value below 0.05, `r n_up` genes were higher and `r n_down` genes were lower in dexamethasone-treated cells.
+
+```{r}
+#| label: results-table
+res_df <- as.data.frame(resLFC) |>
+  rownames_to_column("ensembl") |>
+  mutate(symbol = mapIds(org.Hs.eg.db, keys = ensembl,
+                         column = "SYMBOL", keytype = "ENSEMBL",
+                         multiVals = "first")) |>
+  arrange(padj)
+
+write_csv(res_df, "results/deseq2_results_dex_vs_untreated.csv")
+
+top_tbl <- res_df |>
+  dplyr::slice_head(n = 10) |>
+  dplyr::transmute(
+    Gene = symbol,
+    `Mean count` = round(baseMean),
+    `log2 fold change (shrunk)` = round(log2FoldChange, 2),
+    `Adjusted p-value` = signif(padj, 3)
+  )
+
+knitr::kable(top_tbl, caption = "Ten most significant genes (full table in results/)")
+```
+
+As a sanity check, the top-ranked genes include **DUSP1** and **PER1**, both well-known glucocorticoid-responsive genes that are strongly induced by dexamethasone.
+
+# 6. Volcano plot
+
+```{r}
+#| label: volcano
+#| fig-width: 7
+#| fig-height: 6
+volcano_df <- res_df |>
+  dplyr::filter(!is.na(padj)) |>
+  mutate(status = case_when(
+    padj < 0.05 & log2FoldChange >  1 ~ "Up",
+    padj < 0.05 & log2FoldChange < -1 ~ "Down",
+    TRUE ~ "Not significant"
+  ))
+
+top_labels <- volcano_df |>
+  dplyr::filter(status != "Not significant") |>
+  dplyr::slice_min(padj, n = 12)
+
+volcano <- ggplot(volcano_df, aes(log2FoldChange, -log10(padj), colour = status)) +
+  geom_point(alpha = 0.5, size = 1) +
+  geom_text_repel(data = top_labels, aes(label = symbol),
+                  size = 3, show.legend = FALSE) +
+  scale_colour_manual(values = c(Down = "#2c7bb6",
+                                 `Not significant` = "grey70",
+                                 Up = "#d7191c")) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  labs(title = "Dexamethasone vs untreated airway smooth muscle cells",
+       x = "log2 fold change (shrunk)", y = "-log10 adjusted p-value") +
+  theme_bw()
+
+ggsave("figures/volcano.png", volcano, width = 7, height = 6, dpi = 300)
+volcano
+```
+
+```{r}
+#| label: counts-sig
+n_sig_lfc <- sum(volcano_df$status != "Not significant")
+n_sig_up <- sum(volcano_df$status == "Up")
+n_sig_down <- sum(volcano_df$status == "Down")
+```
+
+Applying both thresholds (adjusted p < 0.05 and |log2 fold change| > 1) gives `r n_sig_lfc` genes, of which `r n_sig_up` are up-regulated and `r n_sig_down` down-regulated. These cut-offs are conventions rather than biological rules.
+
+# 7. Gene Ontology enrichment
+
+```{r}
+#| label: go
+sig_genes <- volcano_df |>
+  dplyr::filter(padj < 0.05, abs(log2FoldChange) > 1) |>
+  pull(ensembl)
+universe <- volcano_df$ensembl   # every gene that was tested
+
+ego <- enrichGO(
+  gene = sig_genes, universe = universe,
+  OrgDb = org.Hs.eg.db, keyType = "ENSEMBL",
+  ont = "BP", pAdjustMethod = "BH",
+  pvalueCutoff = 0.05, qvalueCutoff = 0.2, readable = TRUE
+)
+
+write_csv(as.data.frame(ego), "results/go_bp_enrichment.csv")
+
+go_tbl <- as.data.frame(ego) |>
+  dplyr::slice_head(n = 10) |>
+  mutate(FoldEnrichment = round(FoldEnrichment, 2),
+         p.adjust = signif(p.adjust, 3)) |>
+  dplyr::select(Term = Description, GeneRatio, BgRatio, FoldEnrichment, p.adjust)
+
+knitr::kable(go_tbl, caption = "Top 10 enriched GO Biological Process terms")
+```
+
+```{r}
+#| label: go-plot
+#| fig-width: 8
+#| fig-height: 7
+go_plot <- dotplot(ego, showCategory = 15) +
+  ggtitle("GO Biological Process enrichment")
+ggsave("figures/go_dotplot.png", go_plot, width = 8, height = 7, dpi = 300)
+go_plot
+```
+
+Enriched terms included circulatory system process, blood circulation, vasculature development and regulation of the MAPK cascade. The MAPK term contains DUSP1, DUSP5, DUSP8 and DUSP10, which encode phosphatases that switch off MAPK signalling; induction of DUSP1 is a described mechanism of glucocorticoid anti-inflammatory action. Broad terms such as "circulatory system process" are partly driven by ion-channel genes (for example KCND2, SCN1B and CACNA1G) that are annotated to cardiac physiology, so I treat these terms as descriptive rather than as evidence of vascular effects in airway smooth muscle.
+
+A small fraction of Ensembl IDs could not be mapped to Entrez IDs (roughly 5% of significant genes and 12% of the tested background) and were dropped by `clusterProfiler`.
+
+# 8. Key findings
+
+```{r}
+#| label: top-genes
+top5 <- paste(head(res_df$symbol, 5), collapse = ", ")
+```
+
+- After filtering, `r n_after` genes were tested for differential expression.
+- `r n_up` genes increased and `r n_down` genes decreased with dexamethasone (adjusted p < 0.05); `r n_sig_lfc` also passed the |log2 fold change| > 1 threshold.
+- The five most significant genes were `r top5`. Known glucocorticoid-responsive genes (DUSP1, PER1) were recovered, which supports the validity of the pipeline.
+- Enriched GO terms included MAPK cascade regulation, consistent with induction of dual-specificity phosphatases.
+
+# 9. Limitations
+
+- Only four cell lines (four paired samples per condition), so power is limited and cell-line-specific effects may be over- or under-represented.
+- A single cell type studied in vitro, so findings may not generalise to airway tissue in vivo.
+- The thresholds for significance and fold change are arbitrary conventions.
+- GO enrichment here combines up- and down-regulated genes, which can blur direction-specific biology; testing them separately would be a sensible next step.
+- GO terms are broad and depend on the annotation version used; results are hypothesis-generating, not confirmatory.
+- Some genes could not be mapped between identifier systems and were excluded from enrichment.
+
+# 10. Reproducibility
+
+```{r}
+#| label: versions
+pkgs <- c("DESeq2", "apeglm", "clusterProfiler", "org.Hs.eg.db", "ggplot2", "tidyverse")
+knitr::kable(
+  data.frame(Package = pkgs,
+             Version = sapply(pkgs, function(p) as.character(packageVersion(p))),
+             row.names = NULL),
+  caption = R.version.string
+)
+writeLines(capture.output(sessionInfo()), "results/sessionInfo.txt")
+```
+
+The full session information is saved in `results/sessionInfo.txt`. To reproduce this report, open the RStudio project and render `rnaseq_report.qmd`.
+
+# References
+
+- Himes BE, et al. (2014). RNA-Seq transcriptome profiling identifies CRISPLD2 as a glucocorticoid responsive gene that modulates cytokine function in airway smooth muscle cells. *PLoS ONE* 9(6): e99625.
+- Love MI, Huber W, Anders S (2014). Moderated estimation of fold change and dispersion for RNA-seq data with DESeq2. *Genome Biology* 15: 550.
+- Zhu A, Ibrahim JG, Love MI (2019). Heavy-tailed prior distributions for sequence count data: removing the noise and preserving large differences. *Bioinformatics* 35(12): 2084-2092.
+- clusterProfiler: run `citation("clusterProfiler")` in R for the current recommended citation.
